@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
 const STORAGE_PREFIX = "lockdown-v2";
 
@@ -8,18 +8,41 @@ const uid = () => Math.random().toString(36).slice(2, 8);
 
 function useStorage(key, defaultVal) {
   const fullKey = `${STORAGE_PREFIX}:${key}`;
-  const [data, setData] = useState(() => {
-    try { const s = localStorage.getItem(fullKey); return s ? JSON.parse(s) : defaultVal; }
-    catch { return defaultVal; }
-  });
+  const [data, setData] = useState(defaultVal);
+  const [loaded, setLoaded] = useState(false);
+  const saveTimer = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const result = await window.storage.get(fullKey);
+        if (result && result.value !== undefined && result.value !== null) {
+          setData(JSON.parse(result.value));
+        }
+      } catch {
+        // Key doesn't exist yet — use default
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, [fullKey]);
+
   const save = useCallback((val) => {
     setData((prev) => {
       const next = typeof val === "function" ? val(prev) : val;
-      try { localStorage.setItem(fullKey, JSON.stringify(next)); } catch {}
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+      saveTimer.current = setTimeout(async () => {
+        try {
+          await window.storage.set(fullKey, JSON.stringify(next));
+        } catch (e) {
+          console.error("Storage save failed:", e);
+        }
+      }, 300);
       return next;
     });
   }, [fullKey]);
-  return [data, save];
+
+  return [data, save, loaded];
 }
 
 const PRODUCT_STAGES = [
@@ -292,15 +315,26 @@ function WeekView() {
   );
 }
 
+function SyncIndicator({ syncing }) {
+  if (!syncing) return null;
+  return (
+    <div style={{ position: "fixed", bottom: 16, right: 16, zIndex: 998, padding: "6px 12px", background: "rgba(16,185,129,0.15)", border: "1px solid rgba(16,185,129,0.3)", color: "#10b981", borderRadius: 8, fontSize: 11, fontFamily: "'Fira Code', monospace" }}>
+      ↑ syncing...
+    </div>
+  );
+}
+
 export default function App() {
-  const [dayLogs, setDayLogs] = useStorage("day-logs", {});
-  const [xp, setXp] = useStorage("xp", 0);
-  const [products, setProducts] = useStorage("products", []);
-  const [note, setNote] = useStorage("tomorrow-note", "");
+  const [dayLogs, setDayLogs, dayLogsLoaded] = useStorage("day-logs", {});
+  const [xp, setXp, xpLoaded] = useStorage("xp", 0);
+  const [products, setProducts, productsLoaded] = useStorage("products", []);
+  const [note, setNote, noteLoaded] = useStorage("tomorrow-note", "");
   const [startDate, setStartDate] = useStorage("start-date", null);
   const [studyLogs, setStudyLogs] = useStorage("study-logs", []);
   const [tab, setTab] = useState("dashboard");
+  const allLoaded = dayLogsLoaded && xpLoaded && productsLoaded && noteLoaded;
   const [toast, setToast] = useState(null);
+  const [syncing, setSyncing] = useState(false);
 
   const today = dayKey();
   const todayChecks = dayLogs[today] || {};
@@ -308,7 +342,12 @@ export default function App() {
   const maxSlots = level.slots;
   const activeProducts = products.filter(p => !p.completed && !p.archived);
 
-  const addXP = (amount, msg) => { setXp(prev => prev + amount); setToast(`+${amount} XP · ${msg}`); };
+  const addXP = (amount, msg) => {
+    setXp(prev => prev + amount);
+    setToast(`+${amount} XP · ${msg}`);
+    setSyncing(true);
+    setTimeout(() => setSyncing(false), 1500);
+  };
 
   const handleRoutineToggle = (id) => {
     const wasChecked = todayChecks[id];
@@ -346,6 +385,20 @@ export default function App() {
     }));
   };
 
+  const handleResetAll = async () => {
+    if (!confirm("Reset ALL data? This clears cross-device storage too.")) return;
+    setDayLogs({});
+    setXp(0);
+    setProducts([]);
+    setNote("");
+    setStartDate(null);
+    setStudyLogs([]);
+    const keys = ["day-logs", "xp", "products", "tomorrow-note", "start-date", "study-logs"];
+    for (const k of keys) {
+      try { await window.storage.delete(`${STORAGE_PREFIX}:${k}`); } catch {}
+    }
+  };
+
   const handleStudyLog = (entry) => { setStudyLogs(prev => [...prev, entry]); addXP(5, `Studied: ${entry.topic}`); };
 
   const completedToday = Object.values(todayChecks).filter(Boolean).length;
@@ -359,17 +412,33 @@ export default function App() {
     { id: "study", label: "Study", icon: "📚" },
   ];
 
+  if (!allLoaded) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#050505", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16 }}>
+        <div style={{ fontFamily: "'Fira Code', monospace", fontSize: 12, color: "#333", letterSpacing: 2 }}>LOADING FROM CLOUD...</div>
+        <div style={{ width: 200, height: 2, background: "#111", borderRadius: 1, overflow: "hidden" }}>
+          <div style={{ height: "100%", background: "#f59e0b", borderRadius: 1, animation: "load 1s ease infinite", width: "60%" }} />
+        </div>
+        <style>{"@keyframes load { 0% { transform: translateX(-100%); } 100% { transform: translateX(200%); } }"}</style>
+      </div>
+    );
+  }
+
   return (
     <div style={{ minHeight: "100vh", background: "#050505", color: "#e5e5e5", fontFamily: "'Outfit', 'Segoe UI', sans-serif" }}>
       <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Fira+Code:wght@400;600;700&display=swap" rel="stylesheet" />
       {toast && <XPToast message={toast} onDone={() => setToast(null)} />}
+      <SyncIndicator syncing={syncing} />
 
       <div style={{ padding: "20px 24px", borderBottom: "1px solid #111" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
           <div>
             <div style={{ fontSize: 10, color: "#f59e0b", textTransform: "uppercase", letterSpacing: 3, fontFamily: "'Fira Code', monospace" }}>Ship or Die</div>
             <div style={{ fontSize: 24, fontWeight: 800, color: "#fff" }}>Lockdown HQ</div>
-            <div style={{ fontSize: 12, color: "#444", marginTop: 2 }}>{fmt(new Date())} · Day {daysIn || 0}</div>
+            <div style={{ fontSize: 12, color: "#444", marginTop: 2, display: "flex", alignItems: "center", gap: 8 }}>
+              {fmt(new Date())} · Day {daysIn || 0}
+              <span style={{ fontSize: 9, color: "#10b981", fontFamily: "'Fira Code', monospace", padding: "1px 6px", border: "1px solid rgba(16,185,129,0.3)", borderRadius: 4 }}>☁ synced</span>
+            </div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
             <LevelBadge xp={xp} />
@@ -433,7 +502,7 @@ export default function App() {
                   ))}
                 </div>
               </div>
-              <div style={{ marginTop: 16 }}><button onClick={() => { if (confirm("Reset ALL data?")) { setDayLogs({}); setXp(0); setProducts([]); setNote(""); setStartDate(null); setStudyLogs([]); } }} style={{ padding: "6px 12px", borderRadius: 6, border: "1px solid #151515", background: "transparent", color: "#333", fontSize: 10, cursor: "pointer", fontFamily: "'Fira Code', monospace" }}>Reset All Data</button></div>
+              <div style={{ marginTop: 16 }}><button onClick={() => { handleResetAll() }} style={{ padding: "6px 12px", borderRadius: 6, border: "1px solid #151515", background: "transparent", color: "#333", fontSize: 10, cursor: "pointer", fontFamily: "'Fira Code', monospace" }}>Reset All Data</button></div>
             </div>
           </div>
         )}
